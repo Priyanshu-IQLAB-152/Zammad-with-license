@@ -1,0 +1,247 @@
+x-shared:
+  zammad-service: &zammad-service
+    environment: &zammad-environment
+      MEMCACHE_SERVERS: ${MEMCACHE_SERVERS:-zammad-memcached:11211}
+
+      POSTGRESQL_DB: ${POSTGRES_DB:-zammad_production}
+      POSTGRESQL_HOST: ${POSTGRES_HOST:-zammad-postgresql}
+      POSTGRESQL_USER: ${POSTGRES_USER:-zammad}
+      POSTGRESQL_PASS: ${POSTGRES_PASS:-zammad}
+      POSTGRESQL_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRESQL_OPTIONS: ${POSTGRESQL_OPTIONS:-?pool=50}
+      POSTGRESQL_DB_CREATE:
+
+      REDIS_URL: ${REDIS_URL:-redis://zammad-redis:6379}
+
+      S3_URL:
+
+      # Backup
+      BACKUP_DIR: "${BACKUP_DIR:-/var/tmp/zammad}"
+      BACKUP_TIME: "${BACKUP_TIME:-03:00}"
+      HOLD_DAYS: "${HOLD_DAYS:-10}"
+
+      TZ: "${TZ:-Asia/Kolkata}"
+
+      # Optional
+      AUTOWIZARD_JSON:
+      AUTOWIZARD_RELATIVE_PATH:
+
+      # Elasticsearch
+      ELASTICSEARCH_ENABLED: true
+      ELASTICSEARCH_SCHEMA: http
+      ELASTICSEARCH_HOST: zammad-elasticsearch
+      ELASTICSEARCH_PORT: 9200
+      ELASTICSEARCH_USER:
+      ELASTICSEARCH_PASS:
+      ELASTICSEARCH_NAMESPACE: zammad
+      ELASTICSEARCH_REINDEX:
+
+      # Nginx
+      NGINX_PORT: 8080
+      NGINX_CLIENT_MAX_BODY_SIZE: 100M
+      NGINX_SERVER_NAME: "localhost"
+      NGINX_SERVER_SCHEME: "http"
+
+      # Trusted Proxy
+      RAILS_TRUSTED_PROXIES: '0.0.0.0/0'
+
+      # Zammad
+      ZAMMAD_HTTP_TYPE: "http"
+      ZAMMAD_FQDN: "localhost"
+
+      ZAMMAD_WEB_CONCURRENCY:
+      ZAMMAD_PROCESS_SESSIONS_JOBS_WORKERS:
+      ZAMMAD_PROCESS_SCHEDULED_JOBS_WORKERS:
+      ZAMMAD_PROCESS_DELAYED_JOBS_WORKERS:
+      ZAMMAD_SESSION_JOBS_CONCURRENT:
+
+      # Reverse Proxy
+      VIRTUAL_HOST:
+      VIRTUAL_PORT:
+      LETSENCRYPT_HOST:
+      LETSENCRYPT_EMAIL:
+
+    image: ${IMAGE_REPO:-ghcr.io/zammad/zammad}:${VERSION:-6.5.2-22}
+
+    restart: unless-stopped
+
+    volumes:
+      - ./data/storage:/opt/zammad/storage
+
+    depends_on:
+      - zammad-memcached
+      - zammad-postgresql
+      - zammad-redis
+      - zammad-elasticsearch
+
+services:
+
+  # =========================
+  # Zammad Backup
+  # =========================
+  zammad-backup:
+    <<: *zammad-service
+
+    command: ["zammad-backup"]
+
+    user: 0:0
+
+    volumes:
+      - ./data/backup:/var/tmp/zammad
+      - ./data/storage:/opt/zammad/storage:ro
+
+  # =========================
+  # Elasticsearch
+  # =========================
+  zammad-elasticsearch:
+    image: elasticsearch:${ELASTICSEARCH_VERSION:-8.19.6}
+
+    restart: unless-stopped
+
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+    ports:
+      - "9200:9200"
+
+    volumes:
+      - ./data/elasticsearch:/usr/share/elasticsearch/data
+
+  # =========================
+  # Zammad Init
+  # =========================
+  zammad-init:
+    <<: *zammad-service
+
+    command: ["zammad-init"]
+
+    depends_on:
+      - zammad-postgresql
+
+    restart: on-failure
+
+    user: 0:0
+
+  # =========================
+  # Memcached
+  # =========================
+  zammad-memcached:
+    image: memcached:${MEMCACHE_VERSION:-1.6.39-alpine}
+
+    command: memcached -m 256M
+
+    restart: unless-stopped
+
+  # =========================
+  # Nginx
+  # =========================
+  zammad-nginx:
+    <<: *zammad-service
+
+    command: ["zammad-nginx"]
+
+    expose:
+      - "8080"
+
+    # No "ports:" here anymore — nginx is only reachable through license-proxy now,
+    # same as zabbix-web sits behind license-proxy in the Zabbix stack.
+
+    depends_on:
+      - zammad-railsserver
+
+  # =========================
+  # License Agent
+  # =========================
+  license-agent:
+    build:
+      context: ./license-agent
+      dockerfile: Dockerfile
+    container_name: license-agent
+    environment:
+      ZAMMAD_API_TOKEN: ${ZAMMAD_API_TOKEN}
+    volumes:
+      - ./license/license.lic:/app/license.lic:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - zammad-railsserver
+    restart: unless-stopped
+
+  # =========================
+  # License Proxy
+  # =========================
+  license-proxy:
+    build:
+      context: ./license-proxy
+      dockerfile: Dockerfile
+    container_name: license-proxy
+    depends_on:
+      - zammad-nginx
+      - license-agent
+    ports:
+      - "8082:3333"
+    volumes:
+      - ./license/license.lic:/app/license.lic:ro
+      - ./license-proxy/custom.html:/app/custom.html:ro
+    restart: unless-stopped
+
+  # =========================
+  # PostgreSQL
+  # =========================
+  zammad-postgresql:
+    image: postgres:${POSTGRES_VERSION:-17.6-alpine}
+
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-zammad_production}
+      POSTGRES_USER: ${POSTGRES_USER:-zammad}
+      POSTGRES_PASSWORD: ${POSTGRES_PASS:-zammad}
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+
+  # =========================
+  # Rails Server
+  # =========================
+  zammad-railsserver:
+    <<: *zammad-service
+
+    command: ["zammad-railsserver"]
+
+  # =========================
+  # Redis
+  # =========================
+  zammad-redis:
+    image: redis:${REDIS_VERSION:-7.4.6-alpine}
+
+    restart: unless-stopped
+
+    volumes:
+      - ./data/redis:/data
+
+  # =========================
+  # Scheduler
+  # =========================
+  zammad-scheduler:
+    <<: *zammad-service
+
+    command: ["zammad-scheduler"]
+
+  # =========================
+  # WebSocket
+  # =========================
+  zammad-websocket:
+    <<: *zammad-service
+
+    command: ["zammad-websocket"]
